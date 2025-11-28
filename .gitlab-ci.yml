@@ -1,0 +1,156 @@
+stages:
+  - terraform_ecr
+  - bootstrap
+  - docker_build
+  - docker_push
+  - terraform_plan
+  - terraform_apply
+
+variables:
+  AWS_DEFAULT_REGION: "eu-west-3"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  TERRAFORM_VERSION: "1.13.5"
+
+.terraform_base:
+  image: alpine:3.19
+  before_script:
+    - apk add --update --virtual .deps --no-cache gnupg wget unzip
+    - cd /tmp
+    - wget https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip
+    - wget https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_SHA256SUMS
+    - wget https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_SHA256SUMS.sig
+    - wget -qO- https://www.hashicorp.com/.well-known/pgp-key.txt | gpg --import
+    - gpg --verify terraform_${TERRAFORM_VERSION}_SHA256SUMS.sig terraform_${TERRAFORM_VERSION}_SHA256SUMS
+    - grep terraform_${TERRAFORM_VERSION}_linux_amd64.zip terraform_${TERRAFORM_VERSION}_SHA256SUMS | sha256sum -c
+    - unzip /tmp/terraform_${TERRAFORM_VERSION}_linux_amd64.zip -d /tmp
+    - mv /tmp/terraform /usr/local/bin/terraform
+    - rm -f /tmp/terraform_${TERRAFORM_VERSION}_linux_amd64.zip terraform_${TERRAFORM_VERSION}_SHA256SUMS terraform_${TERRAFORM_VERSION}_SHA256SUMS.sig
+    - apk del .deps
+    - cd ${CI_PROJECT_DIR}
+    - terraform -chdir=terraform init -upgrade
+
+bootstrap:compile_adminer:
+  stage: bootstrap
+  image: php:8.2-cli
+  before_script:
+    - apt-get update && apt-get install -y git make unzip && rm -rf /var/lib/apt/lists/*
+    - curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+  script:
+    - cd adminer-src
+    - git submodule update --init
+    - make
+    - mkdir -p ../adminer-assets/public
+    - cp adminer.php ../adminer-assets/public/adminer.php
+    - cd ../adminer-assets
+    - composer require aws/aws-sdk-php bref/bref --no-interaction
+
+  artifacts:
+    paths:
+      - adminer-assets/public/adminer.php
+      - adminer-assets/vendor/
+    expire_in: 1 hour
+  allow_failure: true
+
+terraform:plan:
+  extends: .terraform_base
+  stage: terraform_plan
+  script:
+    - terraform -chdir=terraform validate
+    - terraform -chdir=terraform plan -out=tfplan -var-file="config.tfvars"
+    - terraform -chdir=terraform show -no-color tfplan > terraform/plan.txt
+  # when: manual
+  artifacts:
+    paths:
+      - terraform/tfplan
+      - terraform/plan.txt
+    expire_in: 1 hour
+
+terraform:ecr:
+  extends: .terraform_base
+  stage: terraform_ecr
+  # needs:
+  #   - job: terraform:plan
+  #     artifacts: true
+  script:
+    - terraform -chdir=terraform apply -var-file="config.tfvars" -auto-approve -target=aws_ecr_repository.adminer -target=aws_ecr_lifecycle_policy.adminer 
+    - terraform -chdir=terraform output -raw ecr_repository_url > terraform/ecr_repository_url.txt
+  artifacts:
+    paths:
+      - terraform/ecr_repository_url.txt
+      - terraform/.terraform/
+    expire_in: 1 hour
+  allow_failure: false
+
+terraform:apply:
+  extends: .terraform_base
+  stage: terraform_apply
+  needs:
+    - job: terraform:plan
+      artifacts: true
+    - job: terraform:ecr
+      artifacts: true
+  script:
+    - terraform -chdir=terraform apply -auto-approve tfplan
+    - terraform -chdir=terraform output -json > terraform/outputs.json
+    - terraform -chdir=terraform output -raw ecr_repository_url > terraform/ecr_repository_url.txt
+  artifacts:
+    paths:
+      - terraform/outputs.json
+      - terraform/ecr_repository_url.txt
+    expire_in: 1 hour
+  when: manual
+  allow_failure: false
+
+docker:build:
+  stage: docker_build
+  image: docker:25
+  services:
+    - docker:25-dind
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_DEFAULT_PLATFORM: "linux/amd64"
+  needs:
+    - job: terraform:ecr
+      artifacts: true
+    - job: bootstrap:compile_adminer
+      artifacts: true
+      optional: true
+  before_script:
+    - apk add --no-cache git
+  script:
+    - docker build --platform linux/amd64 -t adminer:${CI_COMMIT_SHORT_SHA} -f adminer-assets/Dockerfile adminer-assets
+    - docker save adminer:${CI_COMMIT_SHORT_SHA} -o adminer-image.tar
+    - echo "adminer:${CI_COMMIT_SHORT_SHA}" > image_tag.txt
+  artifacts:
+    paths:
+      - adminer-image.tar
+      - image_tag.txt
+    expire_in: 1 hour
+
+docker:push:
+  stage: docker_push
+  image: docker:25
+  services:
+    - docker:25-dind
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_DEFAULT_PLATFORM: "linux/amd64"
+  needs:
+    - job: docker:build
+      artifacts: true
+    - job: terraform:ecr
+      artifacts: true
+  before_script:
+    - apk add --no-cache aws-cli
+  script:
+    - export ECR_REPOSITORY_URL="$(cat terraform/ecr_repository_url.txt)"
+    - export ECR_REGISTRY="${ECR_REPOSITORY_URL%/*}"
+    - export IMAGE_TAG="$(cat image_tag.txt)"
+    - aws ecr get-login-password --region "${AWS_DEFAULT_REGION}" | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+    - docker load -i adminer-image.tar
+    - docker tag "${IMAGE_TAG}" "${ECR_REPOSITORY_URL}:${CI_COMMIT_SHORT_SHA}"
+    - docker tag "${IMAGE_TAG}" "${ECR_REPOSITORY_URL}:latest"
+    - docker push "${ECR_REPOSITORY_URL}:${CI_COMMIT_SHORT_SHA}"
+    - docker push "${ECR_REPOSITORY_URL}:latest"
+  when: manual
