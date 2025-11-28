@@ -1,0 +1,24 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfplan
+*.tfr
+.terraform.lock.hcl
+
+# Terraform vars (exclude config.tfvars if it contains real secrets, currently it seems to be a template)
+# *.tfvars
+
+# Adminer build artifacts
+adminer-assets/public/
+adminer-assets/vendor/
+adminer-image.tar
+image_tag.txt
+
+# Terraform output files
+terraform/plan.txt
+terraform/ecr_repository_url.txt
+terraform/outputs.json
+
+# System
+.DS_Store
